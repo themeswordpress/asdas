@@ -1,0 +1,575 @@
+<?php
+declare(strict_types=1);
+
+/*
+ * Simple Single-File Upload Manager
+ * Features:
+ * - Password login
+ * - Upload files
+ * - List files/folders inside storage directory
+ * - Download files
+ * - Download folders as ZIP
+ *
+ * Requirements:
+ * - PHP 7.4+
+ * - ZipArchive enabled for folder download
+ */
+
+// =========================
+// CONFIG
+// =========================
+const APP_PASSWORD = 'ChangeThisNow123!'; // change this
+const STORAGE_DIR = __DIR__ . '/storage';
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB per file
+
+session_start();
+
+if (!is_dir(STORAGE_DIR)) {
+    mkdir(STORAGE_DIR, 0755, true);
+}
+
+// =========================
+// HELPERS
+// =========================
+function h(string $value): string {
+    return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+}
+
+function isLoggedIn(): bool {
+    return !empty($_SESSION['logged_in']);
+}
+
+function requireLogin(): void {
+    if (!isLoggedIn()) {
+        header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+        exit;
+    }
+}
+
+function normalizeRelativePath(string $path): string {
+    $path = str_replace(['\\', "\0"], ['/', ''], $path);
+    $path = trim($path, '/');
+    return $path;
+}
+
+function realPathInsideStorage(string $relativePath): ?string {
+    $relativePath = normalizeRelativePath($relativePath);
+    $base = realpath(STORAGE_DIR);
+    if ($base === false) {
+        return null;
+    }
+
+    $target = $base . ($relativePath !== '' ? DIRECTORY_SEPARATOR . $relativePath : '');
+    $real = realpath($target);
+
+    if ($real === false) {
+        return null;
+    }
+
+    if ($real === $base || strpos($real, $base . DIRECTORY_SEPARATOR) === 0) {
+        return $real;
+    }
+
+    return null;
+}
+
+function relativeFromStorage(string $fullPath): string {
+    $base = rtrim(str_replace('\\', '/', realpath(STORAGE_DIR)), '/');
+    $full = str_replace('\\', '/', $fullPath);
+    return ltrim(substr($full, strlen($base)), '/');
+}
+
+function sendFileDownload(string $fullPath, ?string $downloadName = null): void {
+    if (!is_file($fullPath) || !is_readable($fullPath)) {
+        http_response_code(404);
+        exit('File not found.');
+    }
+
+    $downloadName ??= basename($fullPath);
+
+    header('Content-Description: File Transfer');
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="' . rawurlencode($downloadName) . '"');
+    header('Content-Length: ' . filesize($fullPath));
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+
+    while (ob_get_level()) {
+        ob_end_clean();
+    }
+
+    $fp = fopen($fullPath, 'rb');
+    if ($fp === false) {
+        http_response_code(500);
+        exit('Unable to open file.');
+    }
+
+    fpassthru($fp);
+    fclose($fp);
+    exit;
+}
+
+function zipFolder(string $folderPath): ?string {
+    if (!class_exists('ZipArchive')) {
+        return null;
+    }
+
+    $zipFile = tempnam(sys_get_temp_dir(), 'zip_');
+    if ($zipFile === false) {
+        return null;
+    }
+
+    // tempnam creates a file; ZipArchive needs a path, so use it directly
+    $zip = new ZipArchive();
+    if ($zip->open($zipFile, ZipArchive::OVERWRITE) !== true) {
+        @unlink($zipFile);
+        return null;
+    }
+
+    $folderPath = realpath($folderPath);
+    if ($folderPath === false) {
+        $zip->close();
+        @unlink($zipFile);
+        return null;
+    }
+
+    $folderName = basename($folderPath);
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($folderPath, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+
+    foreach ($iterator as $item) {
+        $itemPath = $item->getRealPath();
+        if ($itemPath === false) {
+            continue;
+        }
+
+        $localName = $folderName . '/' . ltrim(str_replace('\\', '/', substr($itemPath, strlen($folderPath))), '/');
+
+        if ($item->isDir()) {
+            $zip->addEmptyDir($localName);
+        } else {
+            $zip->addFile($itemPath, $localName);
+        }
+    }
+
+    $zip->close();
+    return $zipFile;
+}
+
+function listStorageItems(string $dir): array {
+    $items = [];
+    $scan = scandir($dir);
+    if ($scan === false) {
+        return $items;
+    }
+
+    foreach ($scan as $name) {
+        if ($name === '.' || $name === '..') {
+            continue;
+        }
+
+        $full = $dir . DIRECTORY_SEPARATOR . $name;
+        $items[] = [
+            'name' => $name,
+            'path' => $full,
+            'is_dir' => is_dir($full),
+            'size' => is_file($full) ? filesize($full) : 0,
+            'mtime' => filemtime($full) ?: 0,
+        ];
+    }
+
+    usort($items, function ($a, $b) {
+        if ($a['is_dir'] !== $b['is_dir']) {
+            return $a['is_dir'] ? -1 : 1;
+        }
+        return strcasecmp($a['name'], $b['name']);
+    });
+
+    return $items;
+}
+
+function formatBytes(int $bytes): string {
+    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    $i = 0;
+    $size = (float)$bytes;
+
+    while ($size >= 1024 && $i < count($units) - 1) {
+        $size /= 1024;
+        $i++;
+    }
+
+    return round($size, 2) . ' ' . $units[$i];
+}
+
+// =========================
+// AUTH
+// =========================
+if (isset($_POST['login_password'])) {
+    $password = (string)($_POST['login_password'] ?? '');
+    if (hash_equals(APP_PASSWORD, $password)) {
+        $_SESSION['logged_in'] = true;
+        header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+        exit;
+    } else {
+        $loginError = 'Invalid password.';
+    }
+}
+
+if (isset($_GET['logout'])) {
+    session_destroy();
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+
+// =========================
+// DOWNLOAD ACTIONS
+// =========================
+if (isLoggedIn() && isset($_GET['download'])) {
+    $relative = (string)$_GET['download'];
+    $fullPath = realPathInsideStorage($relative);
+
+    if ($fullPath === null || !is_file($fullPath)) {
+        http_response_code(404);
+        exit('File not found.');
+    }
+
+    sendFileDownload($fullPath, basename($fullPath));
+}
+
+if (isLoggedIn() && isset($_GET['download_folder'])) {
+    $relative = (string)$_GET['download_folder'];
+    $fullPath = realPathInsideStorage($relative);
+
+    if ($fullPath === null || !is_dir($fullPath)) {
+        http_response_code(404);
+        exit('Folder not found.');
+    }
+
+    $zipPath = zipFolder($fullPath);
+    if ($zipPath === null) {
+        http_response_code(500);
+        exit('ZIP creation failed. Make sure ZipArchive is enabled.');
+    }
+
+    $downloadName = basename($fullPath) . '.zip';
+    sendFileDownload($zipPath, $downloadName);
+}
+
+// =========================
+// UPLOAD ACTION
+// =========================
+$messages = [];
+$errors = [];
+
+if (isLoggedIn() && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['files'])) {
+    requireLogin();
+
+    if (!isset($_FILES['files']['name']) || !is_array($_FILES['files']['name'])) {
+        $errors[] = 'No files received.';
+    } else {
+        $count = count($_FILES['files']['name']);
+
+        for ($i = 0; $i < $count; $i++) {
+            $originalName = (string)$_FILES['files']['name'][$i];
+            $tmpName = (string)$_FILES['files']['tmp_name'][$i];
+            $errorCode = (int)$_FILES['files']['error'][$i];
+            $size = (int)$_FILES['files']['size'][$i];
+
+            if ($errorCode === UPLOAD_ERR_NO_FILE) {
+                continue;
+            }
+
+            if ($errorCode !== UPLOAD_ERR_OK) {
+                $errors[] = "Upload failed for {$originalName}.";
+                continue;
+            }
+
+            if ($size <= 0 || $size > MAX_FILE_SIZE) {
+                $errors[] = "Invalid size for {$originalName}.";
+                continue;
+            }
+
+            $safeName = basename(str_replace(["\0", '/', '\\'], '', $originalName));
+            if ($safeName === '') {
+                $errors[] = 'Invalid file name.';
+                continue;
+            }
+
+            $destination = STORAGE_DIR . DIRECTORY_SEPARATOR . $safeName;
+
+            if (!is_uploaded_file($tmpName)) {
+                $errors[] = "Invalid upload for {$safeName}.";
+                continue;
+            }
+
+            if (!move_uploaded_file($tmpName, $destination)) {
+                $errors[] = "Could not save {$safeName}.";
+                continue;
+            }
+
+            $messages[] = "Uploaded: {$safeName}";
+        }
+    }
+}
+
+// =========================
+// UI
+// =========================
+if (!isLoggedIn()):
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Upload Manager</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f7fb;
+            margin: 0;
+            padding: 40px 20px;
+        }
+        .box {
+            max-width: 420px;
+            margin: 0 auto;
+            background: #fff;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.08);
+        }
+        h1 { margin-top: 0; font-size: 22px; }
+        input[type=password] {
+            width: 100%;
+            padding: 12px;
+            margin: 12px 0;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+        }
+        button {
+            padding: 12px 16px;
+            border: 0;
+            background: #1f6feb;
+            color: #fff;
+            border-radius: 8px;
+            cursor: pointer;
+            width: 100%;
+        }
+        .error {
+            background: #ffe8e8;
+            color: #b00020;
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+        }
+        .note {
+            font-size: 13px;
+            color: #555;
+            margin-top: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>Simple Upload Manager</h1>
+        <?php if (!empty($loginError)): ?>
+            <div class="error"><?= h($loginError) ?></div>
+        <?php endif; ?>
+        <form method="post">
+            <label for="login_password">Password</label>
+            <input id="login_password" name="login_password" type="password" required>
+            <button type="submit">Login</button>
+        </form>
+        <div class="note">
+            Change <code>APP_PASSWORD</code> in the PHP file before using it.
+        </div>
+    </div>
+</body>
+</html>
+<?php
+exit;
+endif;
+
+$items = listStorageItems(STORAGE_DIR);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Upload Manager</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f7fb;
+            margin: 0;
+            padding: 24px;
+            color: #222;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        .card {
+            background: #fff;
+            padding: 20px;
+            border-radius: 14px;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.07);
+            margin-bottom: 20px;
+        }
+        h1, h2 {
+            margin-top: 0;
+        }
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .logout {
+            text-decoration: none;
+            background: #ef4444;
+            color: white;
+            padding: 10px 14px;
+            border-radius: 8px;
+        }
+        .upload-form input[type=file] {
+            margin: 12px 0;
+        }
+        .upload-form button {
+            padding: 10px 16px;
+            border: 0;
+            background: #1f6feb;
+            color: white;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        .msg, .err {
+            padding: 10px 12px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+        }
+        .msg {
+            background: #e9fbe9;
+            color: #1d6b1d;
+        }
+        .err {
+            background: #ffe8e8;
+            color: #b00020;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px 10px;
+            border-bottom: 1px solid #eee;
+            text-align: left;
+            vertical-align: top;
+        }
+        th {
+            background: #fafafa;
+        }
+        a.action {
+            text-decoration: none;
+            padding: 7px 10px;
+            background: #111827;
+            color: white;
+            border-radius: 6px;
+            display: inline-block;
+            margin-right: 6px;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+        .folder {
+            font-weight: bold;
+        }
+        .small {
+            color: #666;
+            font-size: 13px;
+        }
+        code {
+            background: #f1f1f1;
+            padding: 2px 6px;
+            border-radius: 6px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="card">
+        <div class="topbar">
+            <div>
+                <h1>Simple Upload Manager</h1>
+                <div class="small">Storage folder: <code><?= h(STORAGE_DIR) ?></code></div>
+            </div>
+            <a class="logout" href="?logout=1">Logout</a>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Upload Files</h2>
+
+        <?php foreach ($messages as $message): ?>
+            <div class="msg"><?= h($message) ?></div>
+        <?php endforeach; ?>
+
+        <?php foreach ($errors as $error): ?>
+            <div class="err"><?= h($error) ?></div>
+        <?php endforeach; ?>
+
+        <form class="upload-form" method="post" enctype="multipart/form-data">
+            <input type="file" name="files[]" multiple required>
+            <br>
+            <button type="submit">Upload</button>
+        </form>
+        <div class="small">Max file size: <?= h(formatBytes(MAX_FILE_SIZE)) ?></div>
+    </div>
+
+    <div class="card">
+        <h2>Files and Folders</h2>
+
+        <?php if (empty($items)): ?>
+            <p>No files yet.</p>
+        <?php else: ?>
+            <table>
+                <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th>Size</th>
+                    <th>Modified</th>
+                    <th>Actions</th>
+                </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($items as $item): ?>
+                    <?php $relative = relativeFromStorage($item['path']); ?>
+                    <tr>
+                        <td class="<?= $item['is_dir'] ? 'folder' : '' ?>">
+                            <?= h($item['name']) ?>
+                        </td>
+                        <td><?= $item['is_dir'] ? 'Folder' : 'File' ?></td>
+                        <td><?= $item['is_dir'] ? '-' : h(formatBytes((int)$item['size'])) ?></td>
+                        <td><?= h(date('Y-m-d H:i:s', (int)$item['mtime'])) ?></td>
+                        <td>
+                            <?php if ($item['is_dir']): ?>
+                                <a class="action" href="?download_folder=<?= urlencode($relative) ?>">Download Folder ZIP</a>
+                            <?php else: ?>
+                                <a class="action" href="?download=<?= urlencode($relative) ?>">Download File</a>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+    </div>
+</div>
+</body>
+</html>
