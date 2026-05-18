@@ -1,1 +1,1 @@
-https://boppos.bop.ps/api/test
+https://gateway.bop.ps/+CSCOE+/logon.html
