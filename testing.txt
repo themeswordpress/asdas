@@ -1,1 +1,1 @@
-http://84.242.53.57:10500/
+https://goaml.ffu.ps/
