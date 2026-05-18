@@ -1,1 +1,1 @@
-https://goaml.ffu.ps/goAMLPRD/Home
+http://84.242.53.57:10500/
