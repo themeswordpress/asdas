@@ -1,1 +1,1 @@
-http://3س1.220س.148.125:9101
+https://mobilebanking.bop.ps/api/v1.0/info/CheckMobileOsVersion?osType=1&osVersion=16&appVersion=4.0.36
